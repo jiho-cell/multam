@@ -1,98 +1,152 @@
-"""import numpy as np
-import networkx as nx
-
-# 1. 페로몬 업데이트 (개미가 지나갈 때 + 시간이 지날 때)
-def update_pheromones(graph, evaporation_rate=0.05):
-    for u, v in graph.edges():
-        # 페로몬 증발
-        graph[u][v]['pheromone'] *= (1 - evaporation_rate)
-        
-# 2. 페로몬 기반 개미의 다음 노드 확률적 선택
-def select_next_node(graph, current_node):
-    neighbors = list(graph.neighbors(current_node))
-    pheromones = np.array([graph[current_node][nbr]['pheromone'] for nbr in neighbors])
-    capacities = np.array([graph.nodes[nbr]['capacity'] - graph.nodes[nbr]['load'] for nbr in neighbors])
-    
-    # 만약 용량이 가득 차면(Sandpile 과부하) 이동 확률 급감 (저항 증가)
-    capacities = np.maximum(capacities, 0.01) 
-    
-    # 확률 계산 (페로몬이 높고 용량 여유가 있는 곳으로)
-    probabilities = (pheromones ** 1.2) * (capacities ** 1.0)
-    probabilities /= probabilities.sum() # 정규화
-    
-    return np.random.choice(neighbors, p=probabilities)"""
-
+import random
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-import matplotlib.pyplot as plt
 
-def run_opa_simulation(num_nodes=20, steps=100, growth_rate=1.02, upgrade_rate=1.5, fail_prob=0.05):
-    # 1. 초기 네트워크 생성 (Random Graph)
-    G = nx.erdos_renyi_graph(n=num_nodes, p=0.2, seed=42)
-    while not nx.is_connected(G):
-        G = nx.erdos_renyi_graph(n=num_nodes, p=0.2)
 
-    # 노드 속성 초기화: 초기 부하(load) 및 최대 수용 용량(capacity)
-    for node in G.nodes():
-        G.nodes[node]['load'] = np.random.uniform(5, 10)
-        # 수용 용량은 초기 부하의 1.5배로 설정
-        G.nodes[node]['capacity'] = G.nodes[node]['load'] * 1.5
+class AntSandpileNetwork:
 
-    blackout_sizes = []
+    def __init__(
+        self,
+        num_nodes=6,
+        capacity_limit=4,
+        evaporation_rate=0.1,
+        alpha=1.0,
+        beta=1.0,
+    ):
+        """num_nodes: 사전 정의할 노드의 수 (고정)
 
-    for step in range(steps):
-        # --- [장기 동역학 1] 지속적 수요 증가 ---
-        for node in G.nodes():
-            G.nodes[node]['load'] *= growth_rate
+        capacity_limit: 노드가 견딜 수 있는 임계 부하량 (모래산 모델)
+        evaporation_rate: 페로몬 증발 비율 alpha, beta: 페로몬과 가용 용량의 가중치
+        """
+        self.num_nodes = num_nodes
+        self.capacity_limit = capacity_limit
+        self.evaporation_rate = evaporation_rate
+        self.alpha = alpha
+        self.beta = beta
 
-        # --- [단기 동역학 1] 무작위 정전/고장 발생 원인 투입 ---
-        failed_nodes = set()
-        for node in G.nodes():
-            if np.random.rand() < fail_prob:
-                failed_nodes.add(node)
+        # 1. 고정된 노드 수 기반의 그래프 생성 (다이아몬드형/사다리형 네트워크 구성)
+        self.G = nx.DiGraph()
+        self._build_network()
 
-        # --- [단기 동역학 2] 연쇄 붕괴 (Cascading Failure) ---
-        cascade_queue = list(failed_nodes)
-        total_failed_in_step = set(failed_nodes)
+    def _build_network(self):
+        """노드 수와 연결 구조를 설정합니다."""
+        # 노드 추가 (0부터 num_nodes - 1까지)
+        for i in range(self.num_nodes):
+            self.G.add_node(i, load=0)  # load: 현재 노드의 개미 수(부하)
 
-        while cascade_queue:
-            curr = cascade_queue.pop(0)
-            neighbors = list(G.neighbors(curr))
-            
-            # 고장난 노드의 부하를 이웃 노드들에게 등분 재분배
-            if neighbors:
-                shared_load = G.nodes[curr]['load'] / len(neighbors)
-                G.nodes[curr]['load'] = 0  # 초기화
-                
-                for nbr in neighbors:
-                    if nbr not in total_failed_in_step:
-                        G.nodes[nbr]['load'] += shared_load
-                        # 임계 용량을 초과하면 연쇄 붕괴 발생
-                        if G.nodes[nbr]['load'] > G.nodes[nbr]['capacity']:
-                            total_failed_in_step.add(nbr)
-                            cascade_queue.append(nbr)
+        # 경로(Edge) 연결 및 초기 페로몬 설정 (계획서의 사다리형 노드 구조)
+        # 예시: 0(입구) -> 1, 2 -> 3, 4 -> 5(출구) 구조
+        edges = [(0, 1), (0, 2), (1, 3), (2, 3), (1, 4), (2, 4), (3, 5), (4, 5)]
 
-        # 기록: 이번 단계의 정전(붕괴) 규모
-        blackout_sizes.append(len(total_failed_in_step))
+        for u, v in edges:
+            if u < self.num_nodes and v < self.num_nodes:
+                self.G.add_edge(u, v, pheromone=1.0)  # 초기 페로몬값 = 1.0
 
-        # --- [장기 동역학 2] 복구 및 용량 증설 (Upgrade) ---
-        for node in G.nodes():
-            if node in total_failed_in_step:
-                # 정전을 겪은 노드의 용량을 확충
-                G.nodes[node]['capacity'] *= upgrade_rate
-                # 부하 재설정
-                G.nodes[node]['load'] = np.random.uniform(5, 10)
+    def step(self, num_ants_entering=2):
+        """1 스텝 진행: 개미 투입 -> 페로몬 선택 이동 -> 임계치 초과 시 연쇄 붕괴"""
 
-    return blackout_sizes
+        # --- Phase 1: 개미 이동 (Motter-Lai: 페로몬 기반 길 선택) ---
+        current_node = 0
+        for _ in range(num_ants_entering):
+            curr = current_node
+            while curr != self.num_nodes - 1:  # 출구 노드 도착 전까지
+                neighbors = list(self.G.successors(curr))
+                if not neighbors:
+                    break
 
-# 시뮬레이션 실행
-blackout_history = run_opa_simulation(num_nodes=30, steps=200)
+                # 이동 확률 계산 (페로몬 농도 비례)
+                pheromones = np.array(
+                    [self.G[curr][nbr]["pheromone"] for nbr in neighbors]
+                )
+                probabilities = (pheromones**self.alpha) / np.sum(
+                    pheromones**self.alpha
+                )
 
-# 시각화: 시간에 따른 정전 규모 및 붕괴 패턴
-plt.figure(figsize=(10, 4))
-plt.plot(blackout_history, color='crimson', marker='o', markersize=3, linestyle='-')
-plt.title('OPA Model: Blackout Cascade Simulation')
-plt.xlabel('Time Step (Long-term Scale)')
-plt.ylabel('Number of Failed Nodes (Blackout Size)')
-plt.grid(True)
-plt.show()
+                # 확률에 따른 다음 노드 선택
+                next_node = np.random.choice(neighbors, p=probabilities)
+
+                # 선택된 경로에 페로몬 축적 (양의 피드백)
+                self.G[curr][next_node]["pheromone"] += 0.5
+                curr = next_node
+
+                # 해당 노드에 개미 도착 (부하 증가)
+                self.G.nodes[curr]["load"] += 1
+
+        # --- Phase 2: 연쇄 붕괴 (Sandpile Toppling 메커니즘) ---
+        cascade_occurred = False
+        topple_queue = [
+            n
+            for n in self.G.nodes()
+            if self.G.nodes[n]["load"] >= self.capacity_limit
+        ]
+
+        while topple_queue:
+            node = topple_queue.pop(0)
+            if self.G.nodes[node]["load"] >= self.capacity_limit:
+                cascade_occurred = True
+                # 부하 분산 (이웃 노드로 부하 넘김)
+                neighbors = list(self.G.successors(node)) + list(
+                    self.G.predecessors(node)
+                )
+                if neighbors:
+                    excess = self.G.nodes[node]["load"]
+                    self.G.nodes[node]["load"] = 0  # 노드 붕괴 후 초기화
+                    share = excess // len(neighbors)
+
+                    for nbr in neighbors:
+                        self.G.nodes[nbr]["load"] += share
+                        if (
+                            self.G.nodes[nbr]["load"] >= self.capacity_limit
+                            and nbr not in topple_queue
+                        ):
+                            topple_queue.append(nbr)
+
+        # --- Phase 3: 페로몬 자연 증발 ---
+        for u, v in self.G.edges():
+            self.G[u][v]["pheromone"] *= 1 - self.evaporation_rate
+
+        return cascade_occurred
+
+    def draw_network(self, step_num):
+        """네트워크 시각화"""
+        pos = nx.spring_layout(self.G, seed=42)
+        loads = [self.G.nodes[n]["load"] for n in self.G.nodes()]
+        pheromones = [
+            self.G[u][v]["pheromone"] * 2 for u, v in self.G.edges()
+        ]
+
+        plt.figure(figsize=(7, 5))
+        nx.draw_networkx_nodes(
+            self.G,
+            pos,
+            node_color=loads,
+            cmap=plt.cm.Reds,
+            node_size=700,
+            vmin=0,
+            vmax=self.capacity_limit + 2,
+        )
+        nx.draw_networkx_edges(
+            self.G, pos, width=pheromones, edge_color="gray", arrows=True
+        )
+        nx.draw_networkx_labels(
+            self.G,
+            pos,
+            labels={n: f"N{n}\n({self.G.nodes[n]['load']})" for n in self.G.nodes()},
+        )
+
+        plt.title(f"Step {step_num}: Red = Load, Edge Width = Pheromone")
+        plt.axis("off")
+        plt.show()
+
+
+# --- 실행 부 ---
+if __name__ == "__main__":
+    # 노드 수를 6개로 지정하여 네트워크 생성
+    sim = AntSandpileNetwork(num_nodes=6, capacity_limit=4)
+
+    print("=== 시뮬레이션 시작 ===")
+    for step in range(1, 6):
+        is_cascade = sim.step(num_ants_entering=3)
+        print(f"[Step {step}] 연쇄 붕괴(Cascade) 발생 여부: {is_cascade}")
+        sim.draw_network(step)
